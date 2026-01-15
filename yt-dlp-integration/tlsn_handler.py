@@ -8,6 +8,7 @@ Configuration via environment variables:
     TLSN_ENABLED=1          Enable TLSN notarization (default: 1)
     TLSN_CLI_PATH=/path     Path to tlsn-cli binary (default: auto-detect)
     TLSN_PROOF_DIR=./proofs Directory for proof files (default: ./proofs)
+    TLSN_NOTARY_URL=wss://... Remote notary server URL (default: local self-notarization)
 
 Usage:
     # Option 1: Copy to yt_dlp/networking/ and it auto-registers
@@ -76,6 +77,7 @@ class TLSNotaryRH(RequestHandler):
         self.tlsn_enabled = os.environ.get('TLSN_ENABLED', '1') == '1'
         self.tlsn_cli = os.environ.get('TLSN_CLI_PATH') or self._find_tlsn_cli()
         self.proof_dir = Path(os.environ.get('TLSN_PROOF_DIR', './proofs'))
+        self.notary_url = os.environ.get('TLSN_NOTARY_URL')  # Remote notary server
         self.proofs: dict[str, dict] = {}  # video_id -> proof info
 
         # Create proof directory
@@ -159,6 +161,10 @@ class TLSNotaryRH(RequestHandler):
                 if isinstance(body_data, bytes):
                     body_data = body_data.decode('utf-8')
                 cmd.extend(['--body', body_data])
+
+            # Add remote notary server if configured
+            if self.notary_url:
+                cmd.extend(['--notary', self.notary_url])
 
             # Log the notarization attempt
             if self._logger:

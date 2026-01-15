@@ -18,8 +18,9 @@ class TLSNotaryError(Exception):
 class TLSNotaryCLI:
     """Wrapper for tlsn-cli binary"""
 
-    def __init__(self, binary_path: str | None = None):
+    def __init__(self, binary_path: str | None = None, notary_url: str | None = None):
         self.binary = binary_path or self._find_binary()
+        self.notary_url = notary_url or os.environ.get('TLSN_NOTARY_URL')
         if not self.binary:
             raise TLSNotaryError('tlsn-cli binary not found. Build it with: cargo build --release')
 
@@ -176,6 +177,10 @@ class TLSNotaryCLI:
 
         if verbose:
             cmd.append('--verbose')
+
+        # Add remote notary server if configured
+        if self.notary_url:
+            cmd.extend(['--notary', self.notary_url])
 
         try:
             # For stream notarization, we need a longer timeout

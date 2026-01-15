@@ -174,6 +174,20 @@ Environment variables:
 | `TLSN_ENABLED` | `1` | Enable/disable TLSN (set `0` to disable) |
 | `TLSN_CLI_PATH` | auto-detect | Path to tlsn-cli binary |
 | `TLSN_PROOF_DIR` | `./proofs` | Directory for proof files |
+| `TLSN_NOTARY_URL` | (none) | Remote notary server URL (e.g., `wss://notary.example.com:7047`) |
+
+### Remote Notary Server
+
+By default, tlsn-cli uses local self-notarization (prover and verifier run in the same process). For production use, you can connect to a remote notary server:
+
+```bash
+export TLSN_NOTARY_URL="wss://notary.example.com:7047"
+
+# Or pass directly to tlsn-cli
+./tlsn-cli notarize --url https://example.com --notary wss://notary.example.com:7047 --output proof.tlsn
+```
+
+**Note:** Remote notary support is experimental. The notary server must implement the TLSNotary protocol.
 
 ## File Structure
 
@@ -246,12 +260,35 @@ The innertube proof is saved separately as `VIDEO_ID_innertube.tlsn` with the re
 - **Large requests**: Innertube requests must fit in TLSN's buffer limits (~4KB sent, ~1MB received)
 - **URL expiration**: YouTube CDN URLs expire after ~6 hours, proofs remain valid but URL won't work for re-download
 
+### Bandwidth Overhead
+
+Due to the nature of the underlying MPC, the protocol is bandwidth-bound. TLSNotary team is implementing more efficient MPC protocols to decrease the total data transfer.
+
+**Current overhead (2025 protocol):**
+- ~25 MB fixed cost per TLSNotary session
+- ~10 MB per every 1 KB of outgoing data
+- ~40 KB per every 1 KB of incoming data
+
+**Example:** Sending a 1KB HTTP request + 100KB response:
+```
+25 MB (fixed) + 10 MB (1KB out) + 4 MB (100KB in) = ~39 MB upload overhead
+```
+
+This explains why notarizing large responses (like innertube API ~150KB) takes significant bandwidth.
+
 ## Security
 
 - Proofs are unforgeable without breaking TLS or MPC assumptions
 - Server identity verified via certificate chain
 - Content integrity verified via hash commitments
 - Complete chain: video_id → YouTube API → CDN URL → content
+
+## TODO
+
+- [ ] **Remote notary WebSocket support** - Implement actual WebSocket connection to remote notary servers (currently CLI accepts `--notary` flag but uses local self-notarization)
+- [ ] **Proof verification in Python** - Native Python verification without calling tlsn-cli
+- [ ] **Selective disclosure** - Redact sensitive parts of proofs (e.g., IP addresses, cookies) while keeping video_id verifiable
+- [ ] **Proof compression** - Optimize proof file sizes for storage/transfer
 
 ## License
 

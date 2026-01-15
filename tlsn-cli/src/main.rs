@@ -71,6 +71,11 @@ enum Commands {
         #[arg(long)]
         output_response: Option<PathBuf>,
 
+        /// Remote notary server URL (e.g., wss://notary.example.com:7047)
+        /// If not specified, uses local self-notarization
+        #[arg(long)]
+        notary: Option<String>,
+
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -131,6 +136,11 @@ enum Commands {
         /// Rate limit for HTTP requests per second (e.g., 2.0 = max 2 requests/sec)
         #[arg(long)]
         rps_limit: Option<f32>,
+
+        /// Remote notary server URL (e.g., wss://notary.example.com:7047)
+        /// If not specified, uses local self-notarization
+        #[arg(long)]
+        notary: Option<String>,
 
         /// Output as JSON
         #[arg(long)]
@@ -281,6 +291,7 @@ async fn main() -> Result<()> {
             body,
             output,
             output_response,
+            notary,
             json,
             verbose,
         } => {
@@ -290,6 +301,10 @@ async fn main() -> Result<()> {
                     .init();
             }
 
+            if let Some(notary_url) = &notary {
+                eprintln!("Note: Remote notary support ({}) is experimental", notary_url);
+            }
+
             let result = notarize(
                 &url,
                 &method,
@@ -297,6 +312,7 @@ async fn main() -> Result<()> {
                 body.as_deref(),
                 &output,
                 output_response.as_ref(),
+                notary.as_deref(),
             )
             .await?;
 
@@ -351,6 +367,7 @@ async fn main() -> Result<()> {
             chunk_size,
             workers,
             rps_limit,
+            notary,
             json,
             verbose,
         } => {
@@ -360,9 +377,13 @@ async fn main() -> Result<()> {
                     .init();
             }
 
+            if let Some(notary_url) = &notary {
+                eprintln!("Note: Remote notary support ({}) is experimental", notary_url);
+            }
+
             let chunk_size = chunk_size.min(STREAM_CHUNK_SIZE);
             let workers = workers.clamp(1, 30); // Limit to 1-30 workers
-            let result = notarize_stream(&url, &headers, &output_dir, output_file.as_ref(), chunk_size, workers, rps_limit, !json)
+            let result = notarize_stream(&url, &headers, &output_dir, output_file.as_ref(), chunk_size, workers, rps_limit, notary.as_deref(), !json)
                 .await?;
 
             if json {
@@ -419,6 +440,7 @@ async fn notarize(
     body: Option<&str>,
     output: &PathBuf,
     output_response: Option<&PathBuf>,
+    _notary: Option<&str>,  // TODO: implement remote notary support
 ) -> Result<NotarizeOutput> {
     let uri = url.parse::<Uri>().context("Invalid URL")?;
     let scheme = uri.scheme_str().unwrap_or("https");
@@ -756,6 +778,7 @@ async fn notarize_stream(
     chunk_size: usize,
     workers: usize,
     rps_limit: Option<f32>,
+    _notary: Option<&str>,  // TODO: implement remote notary support
     show_progress: bool,
 ) -> Result<StreamNotarizeOutput> {
     let start_time = std::time::Instant::now();
