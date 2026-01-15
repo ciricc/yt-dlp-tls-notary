@@ -1,0 +1,23 @@
+# Build artifacts
+target/
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large binary files (can be reconstructed from proofs)
+examples/*/output.bin
+reconstructed_*
+*.m4a
+*.mp4
+*.webm
+
+# Python
+__pycache__/
+*.pyc
