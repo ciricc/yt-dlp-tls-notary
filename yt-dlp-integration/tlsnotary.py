@@ -5,7 +5,10 @@ import os
 import subprocess
 from pathlib import Path
 
-from .common import PostProcessor
+try:
+    from .common import PostProcessor
+except ImportError:
+    from yt_dlp.postprocessor.common import PostProcessor
 
 
 class TLSNotaryError(Exception):
@@ -367,6 +370,13 @@ class TLSNotaryStreamPP(PostProcessor):
         self.to_screen(f'  URL: {url[:80]}...' if len(url) > 80 else f'  URL: {url}')
         self.to_screen(f'  Workers: {self.workers}, RPS limit: {self.rps_limit}')
 
+        # Check for innertube proof from extractor (proves video_id -> CDN URL)
+        innertube_proof = None
+        if hasattr(self._downloader, '_tlsn_proofs'):
+            innertube_proof = self._downloader._tlsn_proofs.get(video_id)
+            if innertube_proof:
+                self.to_screen(f'  Innertube proof found: {innertube_proof["innertube_proof"]}')
+
         try:
             result = self.cli.notarize_stream(
                 url=url,
@@ -388,7 +398,44 @@ class TLSNotaryStreamPP(PostProcessor):
             info['__tlsnotary_stream_manifest'] = result['manifest_path']
             info['__tlsnotary_stream_result'] = result
 
+            # If we have innertube proof, update manifest to include it
+            if innertube_proof:
+                self._add_innertube_to_manifest(
+                    result['manifest_path'],
+                    innertube_proof,
+                    video_id,
+                    url,
+                )
+
         except TLSNotaryError as e:
             self.report_warning(f'Failed to create TLS Notary stream proof: {e}')
 
         return [], info
+
+    def _add_innertube_to_manifest(self, manifest_path, innertube_proof, video_id, cdn_url):
+        """Add innertube proof reference to the stream manifest"""
+        import shutil
+
+        try:
+            with open(manifest_path, 'r') as f:
+                manifest = json.load(f)
+
+            # Copy innertube proof to stream proof directory
+            proof_dir = Path(manifest_path).parent
+            innertube_dest = proof_dir / 'innertube.tlsn'
+            shutil.copy(innertube_proof['innertube_proof'], innertube_dest)
+
+            # Add metadata section to manifest
+            manifest['metadata'] = {
+                'video_id': video_id,
+                'innertube_proof': 'innertube.tlsn',
+                'cdn_url_verified': cdn_url in open(innertube_proof['innertube_response']).read(),
+            }
+
+            with open(manifest_path, 'w') as f:
+                json.dump(manifest, f, indent=2)
+
+            self.to_screen(f'  Added innertube proof to manifest (video_id: {video_id})')
+
+        except Exception as e:
+            self.report_warning(f'Failed to add innertube proof to manifest: {e}')

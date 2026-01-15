@@ -178,6 +178,23 @@ struct ProofData {
     timestamp: String,
 }
 
+/// Notarized metadata from YouTube oEmbed API
+#[derive(Serialize, Deserialize, Clone)]
+struct MetadataProof {
+    /// Video ID
+    video_id: String,
+    /// oEmbed API URL that was notarized
+    oembed_url: String,
+    /// oEmbed response (JSON)
+    oembed_response: serde_json::Value,
+    /// Path to the proof file
+    proof_file: String,
+    /// Server that responded (should be www.youtube.com)
+    server: String,
+    /// Timestamp when metadata was notarized
+    timestamp: String,
+}
+
 /// Manifest for a stream download with chunked proofs
 #[derive(Serialize, Deserialize, Clone)]
 struct StreamManifest {
@@ -199,6 +216,9 @@ struct StreamManifest {
     started_at: String,
     /// Timestamp when notarization completed
     completed_at: String,
+    /// Optional: notarized YouTube metadata (proves video_id -> title/author)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<MetadataProof>,
 }
 
 /// Information about a single chunk
@@ -910,6 +930,7 @@ async fn notarize_stream(
         chunks,
         started_at,
         completed_at: chrono::Utc::now().to_rfc3339(),
+        metadata: None,  // Metadata proof (video_id -> content link) is added by yt-dlp PostProcessor
     };
 
     let manifest_path = output_dir.join("manifest.json");
