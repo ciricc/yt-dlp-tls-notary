@@ -273,11 +273,17 @@ For third-party verification, use a trusted remote notary:
 - ✓ Third-party attestation (notary's signature)
 
 ```bash
-# Future: Remote notary support
+# Start the notary server
+./tlsn-cli/target/release/notary-server --host 0.0.0.0 --port 7047
+
+# Test connectivity
+./tlsn-cli/target/release/tlsn-cli test-notary --url ws://localhost:7047
+
+# Future: Use remote notary for video downloads
 export TLSN_NOTARY_URL="wss://notary.example.com:7047"
 ```
 
-**Note:** Remote notary WebSocket support is not yet implemented.
+**Note:** WebSocket MPC-TLS works, but attestation flow (server returning signed proof) is not yet implemented.
 
 ## Limitations
 
