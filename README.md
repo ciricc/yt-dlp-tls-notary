@@ -11,6 +11,18 @@ This project creates **cryptographic proofs** that a video was downloaded from Y
 
 Anyone can verify these proofs without trusting the downloader.
 
+## Use Cases
+
+**Metadata-only proofs** (fast, innertube only):
+- Prove video existed with specific title/author at given time
+- Snapshot of video metadata before potential deletion
+
+**Short content proofs** (< 500KB, ~2 min):
+- Audio clips for legal evidence
+- Short video fragments for disputes
+
+**Requirements for third-party trust**: Remote notary server (not yet implemented).
+
 ## Architecture
 
 ```
