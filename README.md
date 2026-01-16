@@ -306,7 +306,8 @@ MPC-TLS has significant bandwidth overhead:
 
 ## TODO
 
-- [ ] **Remote notary WebSocket support** - Connect to remote notary servers
+- [x] **Remote notary WebSocket support** - Connect to remote notary servers via WebSocket
+- [ ] **Remote notary attestation flow** - Server sends signed attestation back to client after MPC-TLS verification (currently MPC works but attestation is not returned)
 - [ ] **Partial download** - `--start-byte` / `--end-byte` to notarize only specific byte range (for quotes/clips)
 - [ ] **Selective disclosure** - Create Presentations that reveal only specific fields (video_id, title) while hiding others (IP, cookies)
 - [ ] **Proof compression** - Optimize proof file sizes

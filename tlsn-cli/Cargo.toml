@@ -8,6 +8,10 @@ description = "CLI tool for TLS Notary - create verifiable proofs of web request
 name = "tlsn-cli"
 path = "src/main.rs"
 
+[[bin]]
+name = "notary-server"
+path = "src/notary_server.rs"
+
 [dependencies]
 # TLSNotary (from git - adjust branch/tag as needed)
 tlsn = { git = "https://github.com/tlsnotary/tlsn", branch = "main", features = ["mozilla-certs"] }
@@ -44,6 +48,9 @@ url = "2"
 sha2 = "0.10"
 reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
 rand = "0.8"
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+pin-project = "1"
+bytes = "1"
 
 [profile.release]
 opt-level = 3

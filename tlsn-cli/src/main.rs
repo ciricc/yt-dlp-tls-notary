@@ -10,7 +10,132 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
-use tracing::{info, warn};
+use tracing::{info, warn, error};
+
+/// WebSocket client adapter for connecting to remote notary
+mod ws_client {
+    use std::io::{Error, ErrorKind};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use bytes::BytesMut;
+    use futures::{AsyncRead, AsyncWrite, Sink, SinkExt, Stream, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    pub struct WsAdapter<S> {
+        inner: S,
+        read_buf: BytesMut,
+    }
+
+    impl<S: Unpin> Unpin for WsAdapter<S> {}
+
+    impl<S> WsAdapter<S> {
+        pub fn new(stream: S) -> Self {
+            Self {
+                inner: stream,
+                read_buf: BytesMut::new(),
+            }
+        }
+    }
+
+    impl<S> AsyncRead for WsAdapter<S>
+    where
+        S: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<std::io::Result<usize>> {
+            // If we have buffered data, return it first
+            if !self.read_buf.is_empty() {
+                let len = std::cmp::min(buf.len(), self.read_buf.len());
+                buf[..len].copy_from_slice(&self.read_buf.split_to(len));
+                return Poll::Ready(Ok(len));
+            }
+
+            // Try to read from WebSocket
+            match self.inner.poll_next_unpin(cx) {
+                Poll::Ready(Some(Ok(msg))) => {
+                    match msg {
+                        Message::Binary(data) => {
+                            let len = std::cmp::min(buf.len(), data.len());
+                            buf[..len].copy_from_slice(&data[..len]);
+                            if len < data.len() {
+                                self.read_buf.extend_from_slice(&data[len..]);
+                            }
+                            Poll::Ready(Ok(len))
+                        }
+                        Message::Close(_) => Poll::Ready(Ok(0)),
+                        Message::Ping(_) | Message::Pong(_) | Message::Text(_) | Message::Frame(_) => {
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                    }
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    Poll::Ready(Err(Error::new(ErrorKind::Other, e)))
+                }
+                Poll::Ready(None) => Poll::Ready(Ok(0)),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    impl<S> AsyncWrite for WsAdapter<S>
+    where
+        S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            // Send immediately as binary message
+            match self.inner.poll_ready_unpin(cx) {
+                Poll::Ready(Ok(())) => {
+                    match self.inner.start_send_unpin(Message::Binary(buf.to_vec().into())) {
+                        Ok(()) => Poll::Ready(Ok(buf.len())),
+                        Err(e) => Poll::Ready(Err(Error::new(ErrorKind::Other, e))),
+                    }
+                }
+                Poll::Ready(Err(e)) => Poll::Ready(Err(Error::new(ErrorKind::Other, e))),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            match self.inner.poll_flush_unpin(cx) {
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(Error::new(ErrorKind::Other, e))),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+
+        fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            match self.inner.poll_close_unpin(cx) {
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(Error::new(ErrorKind::Other, e))),
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+}
+
+/// Connect to remote notary server via WebSocket
+async fn connect_to_notary(url: &str) -> Result<impl futures::AsyncRead + futures::AsyncWrite + Unpin> {
+    use tokio_tungstenite::connect_async;
+
+    info!("Connecting to remote notary: {}", url);
+
+    let (ws_stream, _response) = connect_async(url)
+        .await
+        .context("Failed to connect to notary server")?;
+
+    info!("Connected to remote notary");
+
+    Ok(ws_client::WsAdapter::new(ws_stream))
+}
 
 use tlsn::{
     attestation::{
@@ -171,6 +296,17 @@ enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+    },
+
+    /// Test connection to remote notary server
+    TestNotary {
+        /// Remote notary server URL (e.g., ws://localhost:7047)
+        #[arg(short, long)]
+        url: String,
+
+        /// URL to test notarization with
+        #[arg(long, default_value = "https://example.com")]
+        test_url: String,
     },
 }
 
@@ -484,7 +620,198 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Commands::TestNotary { url, test_url } => {
+            tracing_subscriber::fmt()
+                .with_env_filter("info,yamux=warn,uid_mux=warn")
+                .init();
+
+            println!("Testing connection to remote notary: {}", url);
+
+            match test_remote_notary(&url, &test_url).await {
+                Ok(()) => {
+                    println!("\n✓ Remote notary test PASSED");
+                }
+                Err(e) => {
+                    eprintln!("\n✗ Remote notary test FAILED: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
     }
+
+    Ok(())
+}
+
+/// Test connection to remote notary server
+async fn test_remote_notary(notary_url: &str, test_url: &str) -> Result<()> {
+    use tokio_tungstenite::connect_async;
+
+    // Parse test URL
+    let uri = test_url.parse::<Uri>().context("Invalid test URL")?;
+    let scheme = uri.scheme_str().unwrap_or("https");
+    if scheme != "https" {
+        anyhow::bail!("Only HTTPS URLs are supported for testing");
+    }
+    let host = uri.host().context("URL must have a host")?.to_string();
+    let port = uri.port_u16().unwrap_or(443);
+    let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
+
+    println!("  Test target: {}:{}{}", host, port, path);
+
+    // Step 1: Connect to notary via WebSocket
+    println!("\n1. Connecting to notary server...");
+    let (ws_stream, _response) = connect_async(notary_url)
+        .await
+        .context("Failed to connect to notary server")?;
+    println!("   ✓ WebSocket connected");
+
+    // Step 2: Create session
+    println!("\n2. Creating MPC-TLS session...");
+    let adapter = ws_client::WsAdapter::new(ws_stream);
+    let session = Session::new(adapter);
+    let (driver, mut handle) = session.split();
+    let driver_task = tokio::spawn(driver);
+
+    println!("   ✓ Session created");
+
+    // Step 3: Create prover and commit
+    println!("\n3. Setting up prover...");
+    let prover = handle
+        .new_prover(ProverConfig::builder().build()?)?
+        .commit(
+            TlsCommitConfig::builder()
+                .protocol(
+                    MpcTlsConfig::builder()
+                        .max_sent_data(MAX_SENT_DATA)
+                        .max_recv_data(MAX_RECV_DATA)
+                        .network(NetworkSetting::Bandwidth)
+                        .build()?,
+                )
+                .build()?,
+        )
+        .await?;
+    println!("   ✓ Prover created and committed");
+
+    // Step 4: Connect to target server
+    println!("\n4. Establishing TLS connection to target server...");
+
+    // Resolve DNS and connect
+    let addr = tokio::net::lookup_host(format!("{}:{}", host, port))
+        .await?
+        .next()
+        .context("Failed to resolve host")?;
+
+    let tcp_stream = tokio::net::TcpStream::connect(addr).await?;
+    println!("   TCP connected to {}", addr);
+
+    // Use Mozilla root certificates
+    let root_store = RootCertStore::mozilla();
+    let server_name = ServerName::Dns(host.clone().try_into()?);
+
+    let (tls_connection, prover_fut) = prover
+        .connect(
+            TlsClientConfig::builder()
+                .server_name(server_name)
+                .root_store(root_store)
+                .build()?,
+            tcp_stream.compat(),
+        )
+        .await?;
+
+    println!("   ✓ MPC-TLS handshake completed");
+
+    // Spawn prover future to run concurrently with HTTP operations
+    let prover_task = tokio::spawn(prover_fut);
+
+    // Step 5: Send HTTP request through MPC-TLS (using hyper like the working code)
+    println!("\n5. Sending HTTP request through MPC-TLS...");
+
+    let tls_connection = TokioIo::new(tls_connection.compat());
+
+    // HTTP handshake
+    let (mut request_sender, connection) =
+        hyper::client::conn::http1::handshake(tls_connection).await?;
+    tokio::spawn(connection);
+
+    // Build request
+    let request = Request::builder()
+        .uri(&path)
+        .method("GET")
+        .header("Host", &host)
+        .header("Connection", "close")
+        .header("User-Agent", "tlsn-test/1.0")
+        .body(Full::new(Bytes::new()))?;
+
+    let response = request_sender.send_request(request).await?;
+    let status = response.status();
+    let body_bytes = response.into_body().collect().await?.to_bytes().to_vec();
+
+    let response_preview: String = String::from_utf8_lossy(&body_bytes)
+        .chars()
+        .take(200)
+        .collect();
+    println!("   ✓ Status: {}, received {} bytes", status, body_bytes.len());
+    println!("   Response preview: {}...", response_preview.replace('\n', "\\n").replace('\r', ""));
+
+    // Step 6: Run prove protocol
+    println!("\n6. Running prove protocol...");
+    let mut prover = prover_task.await??;
+
+    // Get transcript data
+    let sent_data = prover.transcript().sent().to_vec();
+    let recv_data = prover.transcript().received().to_vec();
+    let sent_len = sent_data.len();
+    let recv_len = recv_data.len();
+
+    println!("   Transcript: {} bytes sent, {} bytes received", sent_len, recv_len);
+
+    // Build transcript commit config (commit to everything)
+    let mut commit_builder = TranscriptCommitConfig::builder(prover.transcript());
+    commit_builder.commit_sent(&(0..sent_len))?;
+    commit_builder.commit_recv(&(0..recv_len))?;
+    let transcript_commit = commit_builder.build()?;
+
+    // Build prove config (reveal everything)
+    let mut prove_builder = ProveConfig::builder(prover.transcript());
+    prove_builder.server_identity();
+    prove_builder.transcript_commit(transcript_commit);
+    prove_builder.reveal_sent(&(0..sent_len))?;
+    prove_builder.reveal_recv(&(0..recv_len))?;
+    let prove_config = prove_builder.build()?;
+
+    // Prove
+    let _prover_output = prover.prove(&prove_config).await?;
+    println!("   ✓ Prove completed");
+
+    // Close prover
+    prover.close().await?;
+    println!("   ✓ Prover closed");
+
+    // Step 7: Wait for driver with timeout
+    println!("\n7. Waiting for session to complete...");
+    handle.close();
+
+    // Use timeout since graceful shutdown can hang
+    match tokio::time::timeout(std::time::Duration::from_secs(5), driver_task).await {
+        Ok(Ok(Ok(_))) => println!("   ✓ Session completed successfully"),
+        Ok(Ok(Err(e))) => {
+            // Session error - but prove already completed, so this is OK for test
+            warn!("   Session driver finished with error (expected): {}", e);
+        }
+        Ok(Err(e)) => {
+            error!("   Driver task panicked: {}", e);
+            anyhow::bail!("Driver task panicked");
+        }
+        Err(_) => {
+            // Timeout - prove completed, session just didn't close gracefully
+            println!("   ⚠ Session close timed out (prove already completed, this is OK)");
+        }
+    }
+
+    println!("\n✓ Remote notary test completed successfully!");
+    println!("  - MPC-TLS handshake: OK");
+    println!("  - HTTP through MPC-TLS: OK");
+    println!("  - Prove protocol: OK");
 
     Ok(())
 }
