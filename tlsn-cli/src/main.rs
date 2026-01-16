@@ -866,6 +866,57 @@ fn extract_clen_from_url(url: &str) -> Option<u64> {
         .and_then(|(_, v)| v.parse().ok())
 }
 
+/// Extract path and query from URL (without range parameter for comparison)
+/// Returns path + query params excluding 'range' parameter
+fn extract_url_path_for_comparison(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let path = parsed.path();
+
+    // Filter out range parameter from query (it varies per chunk)
+    let query_params: Vec<_> = parsed
+        .query_pairs()
+        .filter(|(k, _)| k != "range")
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect();
+
+    if query_params.is_empty() {
+        Some(path.to_string())
+    } else {
+        Some(format!("{}?{}", path, query_params.join("&")))
+    }
+}
+
+/// Extract request path from HTTP request bytes
+/// Parses "GET /path?query HTTP/1.1" and returns "/path?query"
+fn extract_request_path_from_http(request: &[u8]) -> Option<String> {
+    let request_str = String::from_utf8_lossy(request);
+    let first_line = request_str.lines().next()?;
+
+    // Parse "GET /path HTTP/1.1"
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+    if parts.len() >= 2 {
+        let path = parts[1];
+        // Remove range parameter for comparison
+        if let Ok(url) = url::Url::parse(&format!("https://host{}", path)) {
+            let clean_path = url.path();
+            let query_params: Vec<_> = url
+                .query_pairs()
+                .filter(|(k, _)| k != "range")
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect();
+
+            if query_params.is_empty() {
+                return Some(clean_path.to_string());
+            } else {
+                return Some(format!("{}?{}", clean_path, query_params.join("&")));
+            }
+        }
+        Some(path.to_string())
+    } else {
+        None
+    }
+}
+
 /// Get content length and resolve redirects via HEAD request (without notarization)
 /// Returns (final_url, content_length, accepts_ranges)
 async fn resolve_url_and_get_info(url: &str, headers: &[String]) -> Result<(String, u64, bool)> {
@@ -1489,10 +1540,32 @@ async fn verify_stream(
                         .transcript_proof(transcript_proof);
 
                     if let Ok(presentation) = presentation_builder.build() {
-                        if presentation.verify(&crypto_provider).is_ok() {
-                            crypto_verified = true;
-                        } else {
-                            errors.push(format!("Chunk {}: cryptographic verification failed", chunk.index));
+                        match presentation.verify(&crypto_provider) {
+                            Ok(PresentationOutput { transcript, .. }) => {
+                                crypto_verified = true;
+
+                                // Verify request path matches manifest URL (chain of trust)
+                                // This ensures the chunk was actually requested from the CDN URL
+                                // that was cryptographically proven in the innertube response
+                                if let Some(mut partial_transcript) = transcript {
+                                    partial_transcript.set_unauthed(b'X');
+                                    let sent_bytes = partial_transcript.sent_unsafe();
+
+                                    if let Some(request_path) = extract_request_path_from_http(sent_bytes) {
+                                        if let Some(expected_path) = extract_url_path_for_comparison(&manifest.url) {
+                                            if request_path != expected_path {
+                                                errors.push(format!(
+                                                    "Chunk {}: request path mismatch - CDN URL chain broken (expected {}, got {})",
+                                                    chunk.index, expected_path, request_path
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                errors.push(format!("Chunk {}: cryptographic verification failed", chunk.index));
+                            }
                         }
                     }
                 }
@@ -1500,12 +1573,24 @@ async fn verify_stream(
 
             (proof.response_body, crypto_verified)
         } else if let Ok(legacy) = bincode::deserialize::<ProofData>(&proof_bytes) {
-            // Legacy format - hash-only verification
+            // Legacy format - hash-only verification (no cryptographic proof of request path)
             if legacy.server != manifest.server {
                 errors.push(format!(
                     "Chunk {}: server mismatch (expected {}, got {})",
                     chunk.index, manifest.server, legacy.server
                 ));
+            }
+
+            // Verify request path matches manifest URL (chain of trust)
+            if let Some(request_path) = extract_request_path_from_http(&legacy.sent) {
+                if let Some(expected_path) = extract_url_path_for_comparison(&manifest.url) {
+                    if request_path != expected_path {
+                        errors.push(format!(
+                            "Chunk {}: request path mismatch - CDN URL chain broken (expected {}, got {})",
+                            chunk.index, expected_path, request_path
+                        ));
+                    }
+                }
             }
 
             // Extract body from HTTP response

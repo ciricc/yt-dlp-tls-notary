@@ -54,7 +54,37 @@ The `TLSNotaryRH` request handler integrates at the **transport layer**, interce
 | Video has ID `X` | innertube.tlsn | `jq .videoDetails.videoId *_innertube_response.json` |
 | YouTube returned CDN URL | innertube.tlsn | `jq .streamingData.adaptiveFormats[0].url *_innertube_response.json` |
 | Content came from CDN | chunk proofs (.tlsn files) | `tlsn-cli verify-stream --manifest ...` |
+| Request path matches CDN URL | chunk proofs (sent transcript) | Automatic check in verify-stream |
 | Content not modified | SHA256 hashes | `file_hash == computed_hash` in verify output |
+
+## Chain of Trust
+
+The verification creates an **unbreakable chain** from video ID to content:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 1. INNERTUBE PROOF (cryptographically signed)               │
+│    Request:  POST /youtubei/v1/player {"videoId": "XXX"}    │
+│    Response: {"streamingData": {"url": "https://cdn/..."}}  │
+│    → Proves: YouTube said video XXX has CDN URL Y           │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+                    [PATH COMPARISON]
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 2. CHUNK PROOFS (cryptographically signed)                  │
+│    Request:  GET /videoplayback?id=XXX&itag=140&... (in TLS)│
+│    Response: <binary video data>                            │
+│    → Proves: This exact URL was requested                   │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+                   CDN URL == Request Path? ✓
+```
+
+**Security**: An attacker cannot:
+- Substitute content from a different video (path mismatch detected)
+- Modify the CDN URL in manifest (cryptographic proof contains real path)
+- Use same hostname with different video ID (full path is verified)
 
 ## Performance
 
@@ -159,9 +189,22 @@ with YoutubeDL(ydl_opts) as ydl:
   Chunks: 6 / 6 verified
   ✓ Hashes match
 
+  Request path verification:
+    ✓ Each chunk's request path cryptographically verified
+    ✓ Paths match manifest URL (tampering detected if mismatch)
+
 ==============================================
 ✓ VERIFICATION COMPLETE - All proofs valid
 ==============================================
+```
+
+**Tampering detection example:**
+```
+# If someone modifies the manifest URL to claim different video:
+✗ Stream verification: FAILED
+  Errors:
+    - Chunk 0: request path mismatch - CDN URL chain broken
+      (expected id=FAKE_ID, got id=REAL_ID)
 ```
 
 ## Cryptographic Proof Format
@@ -245,7 +288,9 @@ MPC-TLS has significant bandwidth overhead:
 - Proofs are unforgeable without breaking TLS or MPC assumptions
 - Server identity verified via certificate chain
 - Content integrity verified via hash commitments
+- **Request path verified**: Each chunk proof contains the exact HTTP request (path + query params)
 - Complete chain: video_id → YouTube API → CDN URL → content
+- **Tampering protection**: Modifying manifest URL is detected via path mismatch in chunk proofs
 
 ## TODO
 
