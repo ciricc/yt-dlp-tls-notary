@@ -34,7 +34,7 @@ Output:
 ├── manifest.json           # Links everything together
 ├── innertube.tlsn          # Proof: YouTube said video_id X has URL Y
 └── proofs/
-    ├── chunk_000000.tlsn   # Proof: bytes 0-1MB came from URL Y
+    ├── chunk_000000.tlsn   # Proof: bytes 0-60KB came from URL Y
     ├── chunk_000001.tlsn
     └── ...
 ```
@@ -51,8 +51,8 @@ The `TLSNotaryRH` request handler integrates at the **transport layer**, interce
 
 | Claim | Proof | How to Verify |
 |-------|-------|---------------|
-| Video has ID `X` | innertube.tlsn | `grep videoId *_innertube_response.json` |
-| YouTube returned CDN URL | innertube.tlsn | `grep googlevideo.com *_innertube_response.json` |
+| Video has ID `X` | innertube.tlsn | `jq .videoDetails.videoId *_innertube_response.json` |
+| YouTube returned CDN URL | innertube.tlsn | `jq .streamingData.adaptiveFormats[0].url *_innertube_response.json` |
 | Content came from CDN | chunk proofs (.tlsn files) | `tlsn-cli verify-stream --manifest ...` |
 | Content not modified | SHA256 hashes | `file_hash == computed_hash` in verify output |
 
@@ -60,17 +60,26 @@ The `TLSNotaryRH` request handler integrates at the **transport layer**, interce
 
 | Metric | Value |
 |--------|-------|
-| Innertube notarization | ~20 seconds |
-| Stream download speed | ~75-150 KB/s (depends on workers) |
-| 35MB audio | ~4-5 minutes (20 workers, RPS=2) |
-| Parallelism | Up to 30 workers |
+| Innertube notarization | ~20-30 seconds |
+| Stream chunk size | 60 KB (optimal for YouTube CDN) |
+| Stream notarization | ~20 sec per chunk |
+| 300KB audio (6 chunks) | ~2 minutes |
+| Parallelism | Up to 10 workers |
 
-**Real test results (35.5MB audio file):**
+**Real test results ("Me at the zoo" - 19 sec audio):**
 ```
-Workers: 20, RPS limit: 2.0
-Chunks: 37 × 1MB
-Total time: 257 seconds (~145 KB/s effective)
+Video: jNQXAC9IVRw
+Size: 309,288 bytes
+Chunk size: 60 KB
+Chunks: 6
+Workers: 10
+Total time: 126 seconds
 ```
+
+**Why 60KB chunks?**
+- YouTube CDN has aggressive timeouts (~30-60 sec)
+- MPC-TLS overhead means large chunks timeout before completion
+- 60KB is the sweet spot: fast enough to complete, few enough sessions
 
 ## Quick Start
 
@@ -90,79 +99,95 @@ cargo build --release
 export PATH="$PWD/target/release:$PATH"
 ```
 
-### 2. Install the handler
+### 2. Run with yt-dlp integration
 
-**Option A: Copy to yt-dlp (recommended)**
-```bash
-cp yt-dlp-integration/tlsn_handler.py /path/to/yt_dlp/networking/
-```
-
-**Option B: Import before yt-dlp**
 ```bash
 # Set PYTHONPATH to include the integration directory
 export PYTHONPATH="/path/to/tlsn-youtube-demo/yt-dlp-integration:$PYTHONPATH"
-```
-
-### 3. Usage
-
-```bash
-# Set configuration via environment variables
 export TLSN_PROOF_DIR="./proofs"
-export TLSN_CLI_PATH="/path/to/tlsn-cli"  # Optional if in PATH
-
-# Innertube notarization only (proves video_id → CDN URL)
-python -c "import tlsn_handler; import yt_dlp; yt_dlp.main()" \
-    -f 140 \
-    "https://www.youtube.com/watch?v=VIDEO_ID"
 
 # Full notarization: innertube + stream
-python -c "import tlsn_handler; import yt_dlp; yt_dlp.main()" \
-    -f 140 \
-    --use-postprocessor "TLSNotaryStreamPP:workers=20;rps_limit=2" \
-    "https://www.youtube.com/watch?v=VIDEO_ID"
+python -c "
+import tlsn_handler  # Registers TLSNotaryRH
+from tlsnotary import TLSNotaryStreamPP
+from yt_dlp import YoutubeDL
+
+ydl_opts = {
+    'format': '140',  # audio only
+    'outtmpl': './%(id)s.%(ext)s',
+    'postprocessors': [{
+        'key': 'TLSNotaryStream',
+        'workers': 10,
+        'chunk_size': 60000,
+    }],
+}
+
+with YoutubeDL(ydl_opts) as ydl:
+    ydl.download(['https://youtu.be/VIDEO_ID'])
+"
 ```
 
-### 4. Verify
+### 3. Verify
 
 ```bash
-# Verify the proof chain
+# Full verification with the script
+./scripts/verify_proof.sh ./proofs/VIDEO_ID_tlsn_stream/manifest.json
+
+# Or use tlsn-cli directly
 ./tlsn-cli/target/release/tlsn-cli verify-stream \
-    --manifest ./VIDEO_ID_tlsn_stream/manifest.json \
+    --manifest ./proofs/VIDEO_ID_tlsn_stream/manifest.json \
+    --output verified_video.m4a \
     --json
-
-# Output:
-# {
-#   "valid": true,
-#   "url": "https://rr4---sn-xxx.googlevideo.com/videoplayback?...",
-#   "server": "rr4---sn-xxx.googlevideo.com",
-#   "total_size": 37222910,
-#   "chunks_total": 37,
-#   "chunks_verified": 37,
-#   "file_hash": "67d82cd0...",
-#   "computed_hash": "67d82cd0...",  # Must match file_hash
-#   "errors": []
-# }
-
-# Optionally reconstruct verified file
-./tlsn-cli/target/release/tlsn-cli verify-stream \
-    --manifest ./VIDEO_ID_tlsn_stream/manifest.json \
-    --output verified_video.m4a
 ```
 
-### 5. Verify the Full Chain
+**Example verification output:**
+```
+==============================================
+   TLSNotary Cryptographic Proof Verification
+==============================================
 
-To verify video_id → CDN URL → content:
+=== 1. Innertube API Proof (video_id → CDN URL) ===
+✓ Cryptographic verification: PASSED
+  Server: www.youtube.com
+  Video ID: jNQXAC9IVRw
+  Title: Me at the zoo
+  Author: jawed
 
-```bash
-# 1. Check video_id in innertube response
-grep '"videoId"' ./proofs/VIDEO_ID_innertube_response.json
-# Output: "videoId":"ZorWdKIgSbs"
+=== 2. Stream Proofs (CDN URL → content) ===
+✓ Stream verification: PASSED
+  CDN Server: rr1---sn-xxx.googlevideo.com
+  Chunks: 6 / 6 verified
+  ✓ Hashes match
 
-# 2. Check CDN URL in innertube response matches manifest
-grep 'googlevideo.com/videoplayback' ./proofs/VIDEO_ID_innertube_response.json
+==============================================
+✓ VERIFICATION COMPLETE - All proofs valid
+==============================================
+```
 
-# 3. Verify stream proofs
-./tlsn-cli verify-stream --manifest ./VIDEO_ID_tlsn_stream/manifest.json --json
+## Cryptographic Proof Format
+
+Each `.tlsn` file contains:
+
+- **Attestation** - Public proof with notary's signature
+- **Secrets** - TLS session keys for verification
+
+For sharing proofs:
+1. **Full disclosure**: Share `.tlsn` files directly (includes all data)
+2. **Selective disclosure** (TODO): Create Presentation that reveals only specific fields
+
+### Proof Files
+
+```
+proofs/
+├── VIDEO_ID_innertube.tlsn           # Innertube API proof
+├── VIDEO_ID_innertube_response.json  # API response (for inspection)
+└── VIDEO_ID_tlsn_stream/
+    ├── manifest.json                 # Stream metadata + chunk list
+    ├── output.bin                    # Reconstructed file
+    └── proofs/
+        ├── chunk_000000.tlsn         # Chunk 0 proof
+        ├── chunk_000001.tlsn
+        └── ...
 ```
 
 ## Configuration
@@ -174,107 +199,46 @@ Environment variables:
 | `TLSN_ENABLED` | `1` | Enable/disable TLSN (set `0` to disable) |
 | `TLSN_CLI_PATH` | auto-detect | Path to tlsn-cli binary |
 | `TLSN_PROOF_DIR` | `./proofs` | Directory for proof files |
-| `TLSN_NOTARY_URL` | (none) | Remote notary server URL (e.g., `wss://notary.example.com:7047`) |
 
-### Remote Notary Server
+## Trust Model
 
-By default, tlsn-cli uses local self-notarization (prover and verifier run in the same process). For production use, you can connect to a remote notary server:
+### Self-Notarization (Current)
+
+The prover and notary run in the same process. This provides:
+- ✓ Proof of server identity (TLS certificate)
+- ✓ Proof of data integrity (hashes match)
+- ✗ No third-party attestation
+
+**Use case**: Proving to yourself that data is authentic, or when you trust the prover.
+
+### Remote Notary (Production)
+
+For third-party verification, use a trusted remote notary:
+- ✓ All of the above
+- ✓ Third-party attestation (notary's signature)
 
 ```bash
+# Future: Remote notary support
 export TLSN_NOTARY_URL="wss://notary.example.com:7047"
-
-# Or pass directly to tlsn-cli
-./tlsn-cli notarize --url https://example.com --notary wss://notary.example.com:7047 --output proof.tlsn
 ```
 
-**Note:** Remote notary support is experimental. The notary server must implement the TLSNotary protocol.
-
-## File Structure
-
-```
-tlsn-youtube-demo/
-├── README.md
-├── tlsn-cli/                    # Rust CLI tool
-│   ├── Cargo.toml
-│   └── src/main.rs
-├── yt-dlp-integration/          # yt-dlp integration
-│   ├── tlsn_handler.py          # Request Handler (transport layer)
-│   ├── tlsnotary.py             # PostProcessor (stream notarization)
-│   └── tlsn_download.py         # Convenience wrapper script
-└── yt-dlp-patch/                # Legacy patch approach (optional)
-    ├── README.md
-    └── tlsn_youtube.patch
-```
-
-## How It Works
-
-1. **Request Handler Registration**: When `tlsn_handler` is imported, `@register_rh` decorator adds `TLSNotaryRH` to yt-dlp's request handlers.
-
-2. **Request Interception**: When yt-dlp makes a request to `/youtubei/v1/player`, `TLSNotaryRH` intercepts it based on URL matching and high preference score.
-
-3. **Notarization**: The handler routes the request through `tlsn-cli`, which:
-   - Establishes MPC-TLS session with YouTube
-   - Sends the request and receives the response
-   - Creates cryptographic proof of the exchange
-   - Saves proof and response files
-
-4. **Response Forwarding**: The handler returns the response to yt-dlp, which processes it normally (extracts video URLs, formats, etc.)
-
-5. **Stream Notarization** (optional): `TLSNotaryStreamPP` PostProcessor downloads the video in chunks, each through a separate TLSN session.
-
-## Proof Format
-
-### manifest.json
-
-```json
-{
-  "version": 1,
-  "url": "https://rr4---sn-xxx.googlevideo.com/videoplayback?...",
-  "server": "rr4---sn-xxx.googlevideo.com",
-  "total_size": 37222910,
-  "chunk_size": 1024000,
-  "file_hash": "67d82cd0557c18fdb742ce58a72fc3a5191e83672a0f80f247a8f1f18993aa61",
-  "chunks": [
-    {
-      "index": 0,
-      "range_start": 0,
-      "range_end": 1023999,
-      "size": 1024000,
-      "hash": "c03232cb...",
-      "proof_file": "proofs/chunk_000000.tlsn",
-      "timestamp": "2026-01-15T15:28:51.118066+00:00"
-    },
-    // ... more chunks
-  ],
-  "started_at": "2026-01-15T15:26:46.900104+00:00",
-  "completed_at": "2026-01-15T15:31:04.085630+00:00"
-}
-```
-
-The innertube proof is saved separately as `VIDEO_ID_innertube.tlsn` with the response in `VIDEO_ID_innertube_response.json`.
+**Note:** Remote notary WebSocket support is not yet implemented.
 
 ## Limitations
 
-- **Speed**: ~75-150 KB/s due to MPC overhead (vs 10+ MB/s normal download)
-- **Not all videos**: Some videos require PO tokens or authentication (fallback to normal download)
-- **Large requests**: Innertube requests must fit in TLSN's buffer limits (~4KB sent, ~1MB received)
-- **URL expiration**: YouTube CDN URLs expire after ~6 hours, proofs remain valid but URL won't work for re-download
+- **Speed**: ~2-5 KB/s effective due to MPC overhead (vs 10+ MB/s normal download)
+- **Chunk size**: Must be ≤60KB for YouTube CDN (larger chunks timeout)
+- **Not all videos**: Some require PO tokens or authentication
+- **URL expiration**: CDN URLs expire after ~6 hours
 
 ### Bandwidth Overhead
 
-Due to the nature of the underlying MPC, the protocol is bandwidth-bound. TLSNotary team is implementing more efficient MPC protocols to decrease the total data transfer.
-
-**Current overhead (2025 protocol):**
+MPC-TLS has significant bandwidth overhead:
 - ~25 MB fixed cost per TLSNotary session
-- ~10 MB per every 1 KB of outgoing data
-- ~40 KB per every 1 KB of incoming data
+- ~10 MB per 1 KB of outgoing data
+- ~40 KB per 1 KB of incoming data
 
-**Example:** Sending a 1KB HTTP request + 100KB response:
-```
-25 MB (fixed) + 10 MB (1KB out) + 4 MB (100KB in) = ~39 MB upload overhead
-```
-
-This explains why notarizing large responses (like innertube API ~150KB) takes significant bandwidth.
+**Example:** 60KB chunk = ~25MB + ~2.4MB ≈ 27MB overhead per chunk
 
 ## Security
 
@@ -285,10 +249,10 @@ This explains why notarizing large responses (like innertube API ~150KB) takes s
 
 ## TODO
 
-- [ ] **Remote notary WebSocket support** - Implement actual WebSocket connection to remote notary servers (currently CLI accepts `--notary` flag but uses local self-notarization)
-- [ ] **Proof verification in Python** - Native Python verification without calling tlsn-cli
-- [ ] **Selective disclosure** - Redact sensitive parts of proofs (e.g., IP addresses, cookies) while keeping video_id verifiable
-- [ ] **Proof compression** - Optimize proof file sizes for storage/transfer
+- [ ] **Remote notary WebSocket support** - Connect to remote notary servers
+- [ ] **Selective disclosure** - Create Presentations that reveal only specific fields (video_id, title) while hiding others (IP, cookies)
+- [ ] **Proof compression** - Optimize proof file sizes
+- [ ] **Python verification** - Native verification without calling tlsn-cli
 
 ## License
 

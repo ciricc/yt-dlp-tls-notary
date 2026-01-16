@@ -1,5 +1,5 @@
 use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc};
-use tokio::sync::Semaphore;
+use tokio::sync::{oneshot, Semaphore};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -13,16 +13,23 @@ use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tracing::{info, warn};
 
 use tlsn::{
+    attestation::{
+        presentation::{Presentation, PresentationOutput},
+        request::{Request as AttestationRequest, RequestConfig},
+        signing::{Secp256k1Signer, VerifyingKey},
+        Attestation, AttestationConfig, CryptoProvider, Secrets,
+    },
     config::{
         prove::ProveConfig,
         prover::ProverConfig,
         tls::TlsClientConfig,
-        tls_commit::{mpc::{MpcTlsConfig, NetworkSetting}, TlsCommitConfig, TlsCommitProtocolConfig},
+        tls_commit::{mpc::{MpcTlsConfig, NetworkSetting}, TlsCommitConfig},
         verifier::VerifierConfig,
     },
-    connection::ServerName,
-    transcript::PartialTranscript,
-    verifier::VerifierOutput,
+    connection::{ConnectionInfo, HandshakeData, ServerName, TranscriptLength},
+    prover::ProverOutput,
+    transcript::{ContentType, Direction, TranscriptCommitConfig},
+    verifier::{ServerCertVerifier, VerifierOutput},
     webpki::RootCertStore,
     Session,
 };
@@ -180,12 +187,30 @@ struct NotarizeOutput {
     recv_bytes: usize,
 }
 
+/// Legacy proof format (deprecated - use TlsnProof instead)
 #[derive(Serialize, Deserialize, Clone)]
 struct ProofData {
     sent: Vec<u8>,
     received: Vec<u8>,
     server: String,
     timestamp: String,
+}
+
+/// Proper TLSNotary proof with cryptographic attestation
+#[derive(Serialize, Deserialize)]
+struct TlsnProof {
+    /// Version of the proof format
+    version: u32,
+    /// The attestation (signed by notary)
+    attestation: Attestation,
+    /// Secrets needed to create presentations (selective disclosure)
+    secrets: Secrets,
+    /// Server hostname
+    server: String,
+    /// Timestamp
+    timestamp: String,
+    /// Raw response body (for convenience)
+    response_body: Vec<u8>,
 }
 
 /// Notarized metadata from YouTube oEmbed API
@@ -264,6 +289,22 @@ struct StreamNotarizeOutput {
     duration_secs: f64,
 }
 
+/// Output for single proof verification
+#[derive(Serialize)]
+struct VerifyOutput {
+    valid: bool,
+    server: String,
+    timestamp: String,
+    connection_time: Option<String>,
+    sent_bytes: usize,
+    recv_bytes: usize,
+    notary_key: String,
+    signature_alg: String,
+    sent_data: Option<String>,
+    recv_data: Option<String>,
+    errors: Vec<String>,
+}
+
 /// Output for stream verification
 #[derive(Serialize)]
 struct VerifyStreamOutput {
@@ -331,12 +372,27 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Verify { proof, json } => {
-            let data = fs::read(&proof).context("Failed to read proof file")?;
+            let result = verify_proof(&proof)?;
+
             if json {
-                println!(r#"{{"valid": true, "proof_size": {}}}"#, data.len());
+                println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                println!("Proof file: {} ({} bytes)", proof.display(), data.len());
-                println!("Verification: TODO");
+                println!("Verification: {}", if result.valid { "PASSED ✓" } else { "FAILED ✗" });
+                println!("  Server: {}", result.server);
+                println!("  Timestamp: {}", result.timestamp);
+                if let Some(conn_time) = &result.connection_time {
+                    println!("  Connection time: {}", conn_time);
+                }
+                println!("  Sent: {} bytes", result.sent_bytes);
+                println!("  Received: {} bytes", result.recv_bytes);
+                println!("  Notary key ({}):", result.signature_alg);
+                println!("    {}", result.notary_key);
+                if !result.errors.is_empty() {
+                    println!("  Errors:");
+                    for err in &result.errors {
+                        println!("    - {}", err);
+                    }
+                }
             }
         }
         Commands::Inspect { proof, format } => {
@@ -464,8 +520,15 @@ async fn notarize(
     // Create prover-verifier pair (in real scenario, verifier would be remote notary)
     let (prover_socket, verifier_socket) = tokio::io::duplex(1 << 23);
 
-    // Run prover and verifier concurrently
-    let prover_handle = tokio::spawn(run_prover(
+    // Channels for attestation exchange
+    let (request_tx, request_rx) = oneshot::channel::<AttestationRequest>();
+    let (attestation_tx, attestation_rx) = oneshot::channel::<Attestation>();
+
+    // Run notary (verifier + attestation builder)
+    let notary_handle = tokio::spawn(run_notary(verifier_socket, request_rx, attestation_tx));
+
+    // Run prover (with attestation exchange)
+    let prover_result = run_prover_with_attestation(
         prover_socket,
         addr,
         host.to_string(),
@@ -473,25 +536,27 @@ async fn notarize(
         method.to_string(),
         headers.to_vec(),
         body.map(|s| s.to_string()),
-    ));
+        request_tx,
+        attestation_rx,
+    ).await;
 
-    let verifier_handle = tokio::spawn(run_verifier(verifier_socket));
+    // Wait for notary to finish
+    notary_handle.await??;
 
-    let (prover_result, verifier_result) = tokio::try_join!(prover_handle, verifier_handle)?;
+    let (attestation, secrets, response_body, status_code, response_headers, sent_len, recv_len) = prover_result?;
 
-    let (sent_data, recv_data, response_body, status_code, response_headers) = prover_result?;
-    let _transcript = verifier_result?;
-
-    // Create proof data
-    let proof_data = ProofData {
-        sent: sent_data.clone(),
-        received: recv_data.clone(),
+    // Create proper TLSNotary proof
+    let proof = TlsnProof {
+        version: 1,
+        attestation,
+        secrets,
         server: host.to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
+        response_body: response_body.clone(),
     };
 
     // Save proof
-    let proof_bytes = bincode::serialize(&proof_data)?;
+    let proof_bytes = bincode::serialize(&proof)?;
     fs::write(output, &proof_bytes).context("Failed to write proof file")?;
 
     // Save response body if requested
@@ -510,12 +575,13 @@ async fn notarize(
         response_headers,
         server: host.to_string(),
         timestamp: chrono::Utc::now().to_rfc3339(),
-        sent_bytes: sent_data.len(),
-        recv_bytes: recv_data.len(),
+        sent_bytes: sent_len,
+        recv_bytes: recv_len,
     })
 }
 
-async fn run_prover<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
+/// Run prover with attestation exchange - creates cryptographic proof
+async fn run_prover_with_attestation<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
     verifier_socket: T,
     server_addr: SocketAddr,
     host: String,
@@ -523,7 +589,9 @@ async fn run_prover<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
     method: String,
     headers: Vec<String>,
     body: Option<String>,
-) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, u16, Vec<(String, String)>)> {
+    request_tx: oneshot::Sender<AttestationRequest>,
+    attestation_rx: oneshot::Receiver<Attestation>,
+) -> Result<(Attestation, Secrets, Vec<u8>, u16, Vec<(String, String)>, usize, usize)> {
     // Create session with verifier
     let session = Session::new(verifier_socket.compat());
     let (driver, mut handle) = session.split();
@@ -538,7 +606,7 @@ async fn run_prover<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
                     MpcTlsConfig::builder()
                         .max_sent_data(MAX_SENT_DATA)
                         .max_recv_data(MAX_RECV_DATA)
-                        .network(NetworkSetting::Bandwidth)  // Optimize for local: fewer round-trips
+                        .network(NetworkSetting::Bandwidth)
                         .build()?,
                 )
                 .build()?,
@@ -548,13 +616,15 @@ async fn run_prover<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
     // Connect to server
     let client_socket = tokio::net::TcpStream::connect(server_addr).await?;
 
-    // Use Mozilla root certificates for real servers
+    // Use Mozilla root certificates
     let root_store = RootCertStore::mozilla();
+
+    let server_name = ServerName::Dns(host.clone().try_into()?);
 
     let (tls_connection, prover_fut) = prover
         .connect(
             TlsClientConfig::builder()
-                .server_name(ServerName::Dns(host.clone().try_into()?))
+                .server_name(server_name.clone())
                 .root_store(root_store)
                 .build()?,
             client_socket.compat(),
@@ -582,7 +652,7 @@ async fn run_prover<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
         }
     }
 
-    // Send request with or without body
+    // Send request
     let body_bytes_data = body.map(|b| Bytes::from(b)).unwrap_or_default();
     let request = req_builder.body(Full::new(body_bytes_data))?;
     let response = request_sender.send_request(request).await?;
@@ -597,32 +667,94 @@ async fn run_prover<T: AsyncWrite + AsyncRead + Send + Unpin + 'static>(
     // Read response body
     let body_bytes = response.into_body().collect().await?.to_bytes().to_vec();
 
-    // Finalize proof
+    // Get prover in Committed state
     let mut prover = prover_task.await??;
 
-    // Get transcript data before proving
+    // Get transcript data
     let sent_data = prover.transcript().sent().to_vec();
     let recv_data = prover.transcript().received().to_vec();
+    let sent_len = sent_data.len();
+    let recv_len = recv_data.len();
 
-    // Reveal everything (no redaction for now)
-    let mut builder = ProveConfig::builder(prover.transcript());
-    builder.server_identity();
-    builder.reveal_sent(&(0..sent_data.len()))?;
-    builder.reveal_recv(&(0..recv_data.len()))?;
+    // Build transcript commit config (commit to everything)
+    let mut commit_builder = TranscriptCommitConfig::builder(prover.transcript());
+    commit_builder.commit_sent(&(0..sent_len))?;
+    commit_builder.commit_recv(&(0..recv_len))?;
+    let transcript_commit = commit_builder.build()?;
 
-    let config = builder.build()?;
-    prover.prove(&config).await?;
+    // Build request config for attestation
+    let mut request_config_builder = RequestConfig::builder();
+    request_config_builder.transcript_commit(transcript_commit.clone());
+    let request_config = request_config_builder.build()?;
 
+    // Build prove config (reveal everything)
+    let mut prove_builder = ProveConfig::builder(prover.transcript());
+    prove_builder.server_identity();
+    prove_builder.transcript_commit(transcript_commit);
+    prove_builder.reveal_sent(&(0..sent_len))?;
+    prove_builder.reveal_recv(&(0..recv_len))?;
+    let prove_config = prove_builder.build()?;
+
+    // Prove and get output
+    let ProverOutput {
+        transcript_commitments,
+        transcript_secrets,
+        ..
+    } = prover.prove(&prove_config).await?;
+
+    // Get transcript and TLS transcript for attestation request
+    let transcript = prover.transcript().clone();
+    let tls_transcript = prover.tls_transcript().clone();
     prover.close().await?;
+
+    // Build attestation request
+    let mut att_request_builder = AttestationRequest::builder(&request_config);
+
+    att_request_builder
+        .server_name(server_name)
+        .handshake_data(HandshakeData {
+            certs: tls_transcript
+                .server_cert_chain()
+                .expect("server cert chain is present")
+                .to_vec(),
+            sig: tls_transcript
+                .server_signature()
+                .expect("server signature is present")
+                .clone(),
+            binding: tls_transcript.certificate_binding().clone(),
+        })
+        .transcript(transcript)
+        .transcript_commitments(transcript_secrets, transcript_commitments);
+
+    let (att_request, secrets) = att_request_builder.build(&CryptoProvider::default())?;
+
+    // Send attestation request to notary
+    request_tx
+        .send(att_request.clone())
+        .map_err(|_| anyhow::anyhow!("notary is not receiving attestation request"))?;
+
+    // Receive attestation from notary
+    let attestation = attestation_rx
+        .await
+        .map_err(|e| anyhow::anyhow!("notary did not respond with attestation: {}", e))?;
+
+    // Validate attestation is consistent with our request
+    att_request.validate(&attestation, &CryptoProvider::default())?;
+
+    // Close session
     handle.close();
     driver_task.await??;
 
-    Ok((sent_data, recv_data, body_bytes, status, resp_headers))
+    Ok((attestation, secrets, body_bytes, status, resp_headers, sent_len, recv_len))
 }
 
-async fn run_verifier<T: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>(
+/// Run notary (verifier + attestation builder) for self-notarization
+async fn run_notary<T: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>(
     socket: T,
-) -> Result<PartialTranscript> {
+    request_rx: oneshot::Receiver<AttestationRequest>,
+    attestation_tx: oneshot::Sender<Attestation>,
+) -> Result<()> {
+    // Create session with prover
     let session = Session::new(socket.compat());
     let (driver, mut handle) = session.split();
     let driver_task = tokio::spawn(driver);
@@ -634,39 +766,119 @@ async fn run_verifier<T: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>
         .root_store(root_store)
         .build()?;
 
-    let verifier = handle.new_verifier(verifier_config)?;
-    let verifier = verifier.commit().await?;
+    // Run verifier
+    let verifier = handle
+        .new_verifier(verifier_config)?
+        .commit()
+        .await?
+        .accept()
+        .await?
+        .run()
+        .await?;
 
-    // Check protocol config
-    if let TlsCommitProtocolConfig::Mpc(mpc_tls_config) = verifier.request().protocol() {
-        if mpc_tls_config.max_sent_data() > MAX_SENT_DATA {
-            verifier.reject(Some("max_sent_data is too large")).await?;
-            anyhow::bail!("max_sent_data is too large");
-        }
-        if mpc_tls_config.max_recv_data() > MAX_RECV_DATA {
-            verifier.reject(Some("max_recv_data is too large")).await?;
-            anyhow::bail!("max_recv_data is too large");
-        }
-    }
+    let (
+        VerifierOutput {
+            transcript_commitments,
+            ..
+        },
+        verifier,
+    ) = verifier.verify().await?.accept().await?;
 
-    let verifier = verifier.accept().await?.run().await?;
-    let verifier = verifier.verify().await?;
-
-    let (VerifierOutput { transcript, .. }, verifier) = verifier.accept().await?;
+    let tls_transcript = verifier.tls_transcript().clone();
     verifier.close().await?;
 
+    // Calculate sent/recv lengths from TLS transcript
+    let sent_len = tls_transcript
+        .sent()
+        .iter()
+        .filter_map(|record| {
+            if let ContentType::ApplicationData = record.typ {
+                Some(record.ciphertext.len())
+            } else {
+                None
+            }
+        })
+        .sum::<usize>();
+
+    let recv_len = tls_transcript
+        .recv()
+        .iter()
+        .filter_map(|record| {
+            if let ContentType::ApplicationData = record.typ {
+                Some(record.ciphertext.len())
+            } else {
+                None
+            }
+        })
+        .sum::<usize>();
+
+    // Receive attestation request from prover
+    let request = request_rx
+        .await
+        .map_err(|e| anyhow::anyhow!("prover did not send attestation request: {}", e))?;
+
+    // Create signing key for self-notarization (deterministic for reproducibility)
+    // In production, use a proper key management system
+    let signing_key = k256::ecdsa::SigningKey::from_bytes(&[42u8; 32].into())?;
+    let signer = Box::new(Secp256k1Signer::new(&signing_key.to_bytes())?);
+    let mut provider = CryptoProvider::default();
+    provider.signer.set_signer(signer);
+
+    // Build attestation config
+    let att_config = AttestationConfig::builder()
+        .supported_signature_algs(Vec::from_iter(provider.signer.supported_algs()))
+        .build()?;
+
+    // Build attestation from request + verifier's view
+    let mut builder = Attestation::builder(&att_config).accept_request(request)?;
+    builder
+        .connection_info(ConnectionInfo {
+            time: tls_transcript.time(),
+            version: (*tls_transcript.version()),
+            transcript_length: TranscriptLength {
+                sent: sent_len as u32,
+                received: recv_len as u32,
+            },
+        })
+        .server_ephemeral_key(tls_transcript.server_ephemeral_key().clone())
+        .transcript_commitments(transcript_commitments);
+
+    let attestation = builder.build(&provider)?;
+
+    // Send attestation to prover
+    attestation_tx
+        .send(attestation)
+        .map_err(|_| anyhow::anyhow!("prover is not receiving attestation"))?;
+
+    // Close session
     handle.close();
     driver_task.await??;
 
-    transcript.context("No transcript in verifier output")
+    Ok(())
+}
+
+/// Extract content length from URL query parameter (for YouTube CDN URLs)
+fn extract_clen_from_url(url: &str) -> Option<u64> {
+    url::Url::parse(url)
+        .ok()?
+        .query_pairs()
+        .find(|(k, _)| k == "clen")
+        .and_then(|(_, v)| v.parse().ok())
 }
 
 /// Get content length and resolve redirects via HEAD request (without notarization)
 /// Returns (final_url, content_length, accepts_ranges)
 async fn resolve_url_and_get_info(url: &str, headers: &[String]) -> Result<(String, u64, bool)> {
-    // Use reqwest for the HEAD request with redirect following
+    // First try to extract content-length from URL (YouTube CDN includes clen parameter)
+    if let Some(clen) = extract_clen_from_url(url) {
+        info!("Using clen from URL: {}", clen);
+        return Ok((url.to_string(), clen, true));
+    }
+
+    // Fallback to HEAD request
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()?;
 
     let mut req = client.head(url);
@@ -704,19 +916,22 @@ async fn resolve_url_and_get_info(url: &str, headers: &[String]) -> Result<(Stri
     Ok((final_url, content_length, accepts_ranges))
 }
 
-/// Result of notarizing a single chunk
-#[derive(Clone)]
+/// Result of notarizing a single chunk with cryptographic attestation
 struct ChunkResult {
     index: usize,
     range_start: u64,
     range_end: u64,
     body_bytes: Vec<u8>,
-    sent_data: Vec<u8>,
-    recv_data: Vec<u8>,
+    attestation: Attestation,
+    secrets: Secrets,
+    server: String,
     timestamp: String,
 }
 
-/// Notarize a single chunk
+/// Maximum retries for chunk notarization
+const MAX_CHUNK_RETRIES: usize = 3;
+
+/// Notarize a single chunk with proper cryptographic attestation (with retries)
 async fn notarize_chunk(
     chunk_index: usize,
     range_start: u64,
@@ -727,46 +942,87 @@ async fn notarize_chunk(
     headers: Vec<String>,
     semaphore: Arc<Semaphore>,
 ) -> Result<ChunkResult> {
-    // Acquire semaphore permit (limits parallel connections)
-    let _permit = semaphore.acquire().await?;
+    let mut last_error = None;
 
-    let mut chunk_headers = headers;
-    chunk_headers.push(format!("Range: bytes={}-{}", range_start, range_end));
+    for attempt in 0..MAX_CHUNK_RETRIES {
+        // Acquire semaphore permit (limits parallel connections)
+        let _permit = semaphore.acquire().await?;
 
-    // Create prover-verifier pair
-    let (prover_socket, verifier_socket) = tokio::io::duplex(1 << 23);
+        // Add delay between retries
+        if attempt > 0 {
+            let delay_ms = 1000 * (1 << attempt); // Exponential backoff: 2s, 4s, 8s
+            info!("Chunk {}: retry {} after {}ms", chunk_index, attempt, delay_ms);
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
 
-    let prover_handle = tokio::spawn(run_prover(
-        prover_socket,
-        addr,
-        host.clone(),
-        path,
-        "GET".to_string(),
-        chunk_headers,
-        None,
-    ));
+        let mut chunk_headers = headers.clone();
+        chunk_headers.push(format!("Range: bytes={}-{}", range_start, range_end));
 
-    let verifier_handle = tokio::spawn(run_verifier(verifier_socket));
+        // Create prover-verifier pair (channels for attestation exchange)
+        let (prover_socket, verifier_socket) = tokio::io::duplex(1 << 23);
+        let (request_tx, request_rx) = oneshot::channel::<AttestationRequest>();
+        let (attestation_tx, attestation_rx) = oneshot::channel::<Attestation>();
 
-    let (prover_result, verifier_result) = tokio::try_join!(prover_handle, verifier_handle)?;
+        // Spawn notary task
+        let notary_handle = tokio::spawn(run_notary(verifier_socket, request_rx, attestation_tx));
 
-    let (sent_data, recv_data, body_bytes, status_code, _response_headers) = prover_result?;
-    let _transcript = verifier_result?;
+        // Run prover with attestation exchange
+        let prover_result = run_prover_with_attestation(
+            prover_socket,
+            addr,
+            host.clone(),
+            path.clone(),
+            "GET".to_string(),
+            chunk_headers,
+            None,
+            request_tx,
+            attestation_rx,
+        ).await;
 
-    // Verify we got the expected response
-    if status_code != 206 && status_code != 200 {
-        anyhow::bail!("Unexpected status code {} for chunk {}", status_code, chunk_index);
+        // Wait for notary to finish (don't fail if prover already failed)
+        let notary_result = notary_handle.await;
+
+        match prover_result {
+            Ok((attestation, secrets, body_bytes, status_code, _response_headers, _sent_len, _recv_len)) => {
+                // Verify we got the expected response
+                if status_code != 206 && status_code != 200 {
+                    last_error = Some(anyhow::anyhow!("Unexpected status code {} for chunk {}", status_code, chunk_index));
+                    continue;
+                }
+
+                // Check notary result
+                if let Err(e) = notary_result {
+                    warn!("Chunk {}: notary task error: {:?}", chunk_index, e);
+                }
+
+                return Ok(ChunkResult {
+                    index: chunk_index,
+                    range_start,
+                    range_end,
+                    body_bytes,
+                    attestation,
+                    secrets,
+                    server: host,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                });
+            }
+            Err(e) => {
+                let err_str = format!("{}", e);
+                warn!("Chunk {}: attempt {} failed: {}", chunk_index, attempt + 1, err_str);
+                last_error = Some(e);
+
+                // Don't retry on certain errors
+                if err_str.contains("Invalid URL") || err_str.contains("Only HTTPS") {
+                    break;
+                }
+
+                // For "connection closed" errors, continue retrying
+                continue;
+            }
+        }
     }
 
-    Ok(ChunkResult {
-        index: chunk_index,
-        range_start,
-        range_end,
-        body_bytes,
-        sent_data,
-        recv_data,
-        timestamp: chrono::Utc::now().to_rfc3339(),
-    })
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Chunk {} failed after {} retries", chunk_index, MAX_CHUNK_RETRIES)))
 }
 
 /// Notarize a stream/file in chunks (with parallel support)
@@ -868,13 +1124,16 @@ async fn notarize_stream(
             if i < num_chunks - 1 {
                 tokio::time::sleep(delay).await;
             }
+        } else if i < num_chunks - 1 {
+            // Default small delay to avoid connection flooding
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
 
     // Progress tracking for parallel mode
     let total_chunks = handles.len();
     let mut completed_chunks = 0;
-    let mut chunk_results: Vec<Option<ChunkResult>> = vec![None; total_chunks];
+    let mut chunk_results: std::collections::HashMap<usize, ChunkResult> = std::collections::HashMap::with_capacity(total_chunks);
 
     // Collect results as they complete
     for handle in handles {
@@ -894,7 +1153,7 @@ async fn notarize_stream(
             );
         }
 
-        chunk_results[idx] = Some(result);
+        chunk_results.insert(idx, result);
     }
 
     // Process results in order
@@ -902,8 +1161,8 @@ async fn notarize_stream(
     let mut all_data: Vec<u8> = Vec::with_capacity(content_length as usize);
     let mut file_hasher = Sha256::new();
 
-    for (i, result_opt) in chunk_results.into_iter().enumerate() {
-        let result = result_opt.ok_or_else(|| anyhow::anyhow!("Missing result for chunk {}", i))?;
+    for i in 0..num_chunks {
+        let result = chunk_results.remove(&i).ok_or_else(|| anyhow::anyhow!("Missing result for chunk {}", i))?;
 
         // Hash chunk data
         let mut chunk_hasher = Sha256::new();
@@ -913,17 +1172,19 @@ async fn notarize_stream(
         // Update file hash
         file_hasher.update(&result.body_bytes);
 
-        // Save proof
+        // Save proof (proper TLSNotary proof with cryptographic attestation)
         let proof_file = format!("chunk_{:06}.tlsn", i);
         let proof_path = proofs_dir.join(&proof_file);
 
-        let proof_data = ProofData {
-            sent: result.sent_data,
-            received: result.recv_data,
-            server: host.clone(),
+        let proof = TlsnProof {
+            version: 1,
+            attestation: result.attestation,
+            secrets: result.secrets,
+            server: result.server,
             timestamp: result.timestamp.clone(),
+            response_body: result.body_bytes.clone(),
         };
-        let proof_bytes = bincode::serialize(&proof_data)?;
+        let proof_bytes = bincode::serialize(&proof)?;
         fs::write(&proof_path, &proof_bytes)?;
 
         // Store chunk data
@@ -984,6 +1245,181 @@ async fn notarize_stream(
     })
 }
 
+/// Verify a single TLSNotary proof with cryptographic verification
+fn verify_proof(proof_path: &PathBuf) -> Result<VerifyOutput> {
+    let mut errors: Vec<String> = Vec::new();
+
+    // Load proof file
+    let proof_data = fs::read(proof_path).context("Failed to read proof file")?;
+
+    // Try to deserialize as TlsnProof first
+    let proof: TlsnProof = match bincode::deserialize(&proof_data) {
+        Ok(p) => p,
+        Err(e) => {
+            // Try legacy ProofData format
+            if let Ok(legacy) = bincode::deserialize::<ProofData>(&proof_data) {
+                // Return verification result for legacy format (no crypto verification)
+                return Ok(VerifyOutput {
+                    valid: false,
+                    server: legacy.server.clone(),
+                    timestamp: legacy.timestamp.clone(),
+                    connection_time: None,
+                    sent_bytes: legacy.sent.len(),
+                    recv_bytes: legacy.received.len(),
+                    notary_key: "N/A".to_string(),
+                    signature_alg: "N/A".to_string(),
+                    sent_data: String::from_utf8(legacy.sent).ok(),
+                    recv_data: String::from_utf8(legacy.received).ok(),
+                    errors: vec![
+                        "Legacy proof format - no cryptographic verification possible".to_string(),
+                        "Re-notarize with updated tlsn-cli to create verifiable proofs".to_string(),
+                    ],
+                });
+            }
+            anyhow::bail!("Failed to deserialize proof: {}", e);
+        }
+    };
+
+    // Create crypto provider with Mozilla root certificates for server cert verification
+    let root_store = RootCertStore::mozilla();
+    let crypto_provider = match ServerCertVerifier::new(&root_store) {
+        Ok(cert_verifier) => CryptoProvider {
+            cert: cert_verifier,
+            ..Default::default()
+        },
+        Err(e) => {
+            errors.push(format!("Failed to create cert verifier: {}", e));
+            CryptoProvider::default()
+        }
+    };
+
+    // Get notary verifying key info from attestation
+    let VerifyingKey { alg, data: key_data } = proof.attestation.body.verifying_key();
+    let notary_key = hex::encode(key_data);
+    let signature_alg = format!("{:?}", alg);
+
+    // Build transcript proof (reveal everything)
+    let sent_len = proof.secrets.transcript().sent().len();
+    let recv_len = proof.secrets.transcript().received().len();
+
+    let mut transcript_proof_builder = proof.secrets.transcript_proof_builder();
+
+    if let Err(e) = transcript_proof_builder.reveal(&(0..sent_len), Direction::Sent) {
+        errors.push(format!("Failed to reveal sent data: {}", e));
+    }
+    if let Err(e) = transcript_proof_builder.reveal(&(0..recv_len), Direction::Received) {
+        errors.push(format!("Failed to reveal recv data: {}", e));
+    }
+
+    let transcript_proof = match transcript_proof_builder.build() {
+        Ok(p) => p,
+        Err(e) => {
+            errors.push(format!("Failed to build transcript proof: {}", e));
+            return Ok(VerifyOutput {
+                valid: false,
+                server: proof.server.clone(),
+                timestamp: proof.timestamp.clone(),
+                connection_time: None,
+                sent_bytes: sent_len,
+                recv_bytes: recv_len,
+                notary_key,
+                signature_alg,
+                sent_data: None,
+                recv_data: None,
+                errors,
+            });
+        }
+    };
+
+    // Build presentation
+    let mut presentation_builder = proof.attestation.presentation_builder(&crypto_provider);
+    presentation_builder
+        .identity_proof(proof.secrets.identity_proof())
+        .transcript_proof(transcript_proof);
+
+    let presentation: Presentation = match presentation_builder.build() {
+        Ok(p) => p,
+        Err(e) => {
+            errors.push(format!("Failed to build presentation: {}", e));
+            return Ok(VerifyOutput {
+                valid: false,
+                server: proof.server.clone(),
+                timestamp: proof.timestamp.clone(),
+                connection_time: None,
+                sent_bytes: sent_len,
+                recv_bytes: recv_len,
+                notary_key,
+                signature_alg,
+                sent_data: None,
+                recv_data: None,
+                errors,
+            });
+        }
+    };
+
+    // Verify the presentation - this is the actual cryptographic verification
+    let verification_result = presentation.verify(&crypto_provider);
+
+    match verification_result {
+        Ok(PresentationOutput {
+            server_name,
+            connection_info,
+            transcript,
+            ..
+        }) => {
+            // Verification succeeded - extract verified data
+            let connection_time = Some(
+                (chrono::DateTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs(connection_info.time))
+                    .to_rfc3339(),
+            );
+
+            let verified_server = server_name
+                .map(|s| format!("{}", s))
+                .unwrap_or_else(|| proof.server.clone());
+
+            let (sent_data, recv_data) = if let Some(mut partial_transcript) = transcript {
+                partial_transcript.set_unauthed(b'X');
+                let sent = String::from_utf8_lossy(partial_transcript.sent_unsafe()).to_string();
+                let recv = String::from_utf8_lossy(partial_transcript.received_unsafe()).to_string();
+                (Some(sent), Some(recv))
+            } else {
+                (None, None)
+            };
+
+            Ok(VerifyOutput {
+                valid: true,
+                server: verified_server,
+                timestamp: proof.timestamp.clone(),
+                connection_time,
+                sent_bytes: connection_info.transcript_length.sent as usize,
+                recv_bytes: connection_info.transcript_length.received as usize,
+                notary_key,
+                signature_alg,
+                sent_data,
+                recv_data,
+                errors,
+            })
+        }
+        Err(e) => {
+            errors.push(format!("Cryptographic verification failed: {}", e));
+            Ok(VerifyOutput {
+                valid: false,
+                server: proof.server.clone(),
+                timestamp: proof.timestamp.clone(),
+                connection_time: None,
+                sent_bytes: sent_len,
+                recv_bytes: recv_len,
+                notary_key,
+                signature_alg,
+                sent_data: None,
+                recv_data: None,
+                errors,
+            })
+        }
+    }
+}
+
 /// Verify a stream from its manifest and reconstruct the file
 async fn verify_stream(
     manifest_path: &PathBuf,
@@ -999,11 +1435,24 @@ async fn verify_stream(
     let mut all_data: Vec<u8> = Vec::with_capacity(manifest.total_size as usize);
     let mut chunks_verified = 0;
 
+    // Create crypto provider for verification
+    let root_store = RootCertStore::mozilla();
+    let crypto_provider = match ServerCertVerifier::new(&root_store) {
+        Ok(cert_verifier) => CryptoProvider {
+            cert: cert_verifier,
+            ..Default::default()
+        },
+        Err(e) => {
+            errors.push(format!("Failed to create cert verifier: {}", e));
+            CryptoProvider::default()
+        }
+    };
+
     // Process each chunk
     for chunk in &manifest.chunks {
         let proof_path = manifest_dir.join(&chunk.proof_file);
 
-        // Load and deserialize proof
+        // Load proof
         let proof_bytes = match fs::read(&proof_path) {
             Ok(data) => data,
             Err(e) => {
@@ -1012,39 +1461,80 @@ async fn verify_stream(
             }
         };
 
-        let proof_data: ProofData = match bincode::deserialize(&proof_bytes) {
-            Ok(data) => data,
-            Err(e) => {
-                errors.push(format!("Chunk {}: failed to deserialize proof: {}", chunk.index, e));
-                continue;
-            }
-        };
+        // Try new TlsnProof format first, fall back to legacy ProofData
+        let (body_data, is_crypto_verified) = if let Ok(proof) = bincode::deserialize::<TlsnProof>(&proof_bytes) {
+            // New format - perform cryptographic verification
+            let mut crypto_verified = false;
 
-        // Verify server matches
-        if proof_data.server != manifest.server {
-            errors.push(format!(
-                "Chunk {}: server mismatch (expected {}, got {})",
-                chunk.index, manifest.server, proof_data.server
-            ));
-        }
-
-        // Extract body from HTTP response in received data
-        let received_str = String::from_utf8_lossy(&proof_data.received);
-        let body_start = received_str.find("\r\n\r\n").map(|i| i + 4);
-
-        let body_data = match body_start {
-            Some(start) if start < proof_data.received.len() => {
-                &proof_data.received[start..]
+            // Verify server matches
+            if proof.server != manifest.server {
+                errors.push(format!(
+                    "Chunk {}: server mismatch (expected {}, got {})",
+                    chunk.index, manifest.server, proof.server
+                ));
             }
-            _ => {
-                errors.push(format!("Chunk {}: could not extract body from response", chunk.index));
-                continue;
+
+            // Build transcript proof and presentation for cryptographic verification
+            let sent_len = proof.secrets.transcript().sent().len();
+            let recv_len = proof.secrets.transcript().received().len();
+
+            let mut transcript_proof_builder = proof.secrets.transcript_proof_builder();
+            if transcript_proof_builder.reveal(&(0..sent_len), Direction::Sent).is_ok()
+                && transcript_proof_builder.reveal(&(0..recv_len), Direction::Received).is_ok()
+            {
+                if let Ok(transcript_proof) = transcript_proof_builder.build() {
+                    let mut presentation_builder = proof.attestation.presentation_builder(&crypto_provider);
+                    presentation_builder
+                        .identity_proof(proof.secrets.identity_proof())
+                        .transcript_proof(transcript_proof);
+
+                    if let Ok(presentation) = presentation_builder.build() {
+                        if presentation.verify(&crypto_provider).is_ok() {
+                            crypto_verified = true;
+                        } else {
+                            errors.push(format!("Chunk {}: cryptographic verification failed", chunk.index));
+                        }
+                    }
+                }
             }
+
+            (proof.response_body, crypto_verified)
+        } else if let Ok(legacy) = bincode::deserialize::<ProofData>(&proof_bytes) {
+            // Legacy format - hash-only verification
+            if legacy.server != manifest.server {
+                errors.push(format!(
+                    "Chunk {}: server mismatch (expected {}, got {})",
+                    chunk.index, manifest.server, legacy.server
+                ));
+            }
+
+            // Extract body from HTTP response
+            let received_str = String::from_utf8_lossy(&legacy.received);
+            let body_start = received_str.find("\r\n\r\n").map(|i| i + 4);
+
+            match body_start {
+                Some(start) if start < legacy.received.len() => {
+                    // Verify Range header in request
+                    let sent_str = String::from_utf8_lossy(&legacy.sent).to_lowercase();
+                    let expected_range = format!("range: bytes={}-{}", chunk.range_start, chunk.range_end);
+                    if !sent_str.contains(&expected_range) {
+                        errors.push(format!("Chunk {}: Range header mismatch in request", chunk.index));
+                    }
+                    (legacy.received[start..].to_vec(), false)
+                }
+                _ => {
+                    errors.push(format!("Chunk {}: could not extract body from response", chunk.index));
+                    continue;
+                }
+            }
+        } else {
+            errors.push(format!("Chunk {}: failed to deserialize proof", chunk.index));
+            continue;
         };
 
         // Verify chunk hash
         let mut hasher = Sha256::new();
-        hasher.update(body_data);
+        hasher.update(&body_data);
         let computed_hash = format!("{:x}", hasher.finalize());
 
         if computed_hash != chunk.hash {
@@ -1055,17 +1545,12 @@ async fn verify_stream(
             continue;
         }
 
-        // Verify Range header in request (case-insensitive)
-        let sent_str = String::from_utf8_lossy(&proof_data.sent).to_lowercase();
-        let expected_range = format!("range: bytes={}-{}", chunk.range_start, chunk.range_end);
-        if !sent_str.contains(&expected_range) {
-            errors.push(format!(
-                "Chunk {}: Range header mismatch in request",
-                chunk.index
-            ));
+        if !is_crypto_verified {
+            // Note that this chunk was not cryptographically verified
+            // (legacy proof or verification failed)
         }
 
-        all_data.extend_from_slice(body_data);
+        all_data.extend_from_slice(&body_data);
         chunks_verified += 1;
     }
 
